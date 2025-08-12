@@ -1,0 +1,187 @@
+\documentclass[11pt, a4paper]{article}
+
+% PACKAGES
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsfonts}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+% METADATA
+\title{Deep State-Space Model with Neural Categorical Latents}
+\author{A Technical Implementation Guide}
+\date{\today}
+
+% LISTINGS CONFIGURATION (for code blocks)
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+% CUSTOM COMMANDS
+\newcommand{\elbo}{\mathcal{L}}
+\DeclareMathOperator*{\E}{\mathbb{E}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document provides a rigorous technical guide to a PyTorch implementation of a Deep State-Space Model (DSSM) for unsupervised discovery of discrete states in sequential data. We detail the mathematical formulation, the precise mapping of theoretical terms to their implementation in code, the synthetic data generation mechanism, and usage instructions.
+\end{abstract}
+
+\section{Mathematical Formulation}
+We model a sequence of observations $X \triangleq (x_1, \dots, x_T)$ by assuming they are generated from a sequence of discrete latent states $C \triangleq (c_1, \dots, c_T)$, where each state $c_t$ is a categorical variable, $c_t \in \{1, \dots, K\}$.
+
+\subsection{The Generative Model}
+The generative process $p_{\theta}(X, C)$ is a Hidden Markov Model with neural network components.
+\begin{equation}
+p_{\theta}(X, C) = p(c_1) \prod_{t=2}^{T} p_{\theta}(c_t | c_{t-1}) \prod_{t=1}^{T} p_{\theta}(x_t | c_t)
+\end{equation}
+
+\subsection{The Structured Inference Model}
+We approximate the intractable true posterior $p_{\theta}(C|X)$ with a structured variational distribution $q_{\phi}(C|X)$.
+\begin{equation}
+q_{\phi}(C|X) = q_{\phi}(c_1 | X) \prod_{t=2}^{T} q_{\phi}(c_t | c_{t-1}, X)
+\end{equation}
+
+\subsection{The Evidence Lower Bound (ELBO)}
+We train the model by maximizing the ELBO, $\elbo(\theta, \phi)$, a lower bound on the log-likelihood of the data.
+\begin{equation}
+\elbo = \sum_{t=1}^{T} \E_{q_{\phi}(c_t|X)}[\log p_{\theta}(x_t | c_t)] - D_{KL}(q_{\phi}(c_1|X) \,\|\, p(c_1)) - \sum_{t=2}^{T} \E_{q_{\phi}(c_{t-1}|X)} \left[ D_{KL}(q_{\phi}(c_t | c_{t-1}, X) \,\|\, p_{\theta}(c_t | c_{t-1})) \right]
+\end{equation}
+
+\section{Implementation Details (\texttt{model.py})}
+This section maps the mathematical terms to their implementation. Let $X \in \mathbb{R}^{B \times T \times N_f}$ be a batch of sequences, where $B$ is batch size, $T$ is sequence length, $K$ is the number of states, and $N_f$ is the number of features.
+
+\subsection{Inference Model ($q_{\phi}$)}
+The inference model is processed sequentially for $t=1, \dots, T$.
+
+\paragraph{1. Bi-RNN Context Encoder (\texttt{self.birnn})}
+\begin{itemize}
+    \item \textbf{Input}: The full observation sequence \texttt{x} ($X$).
+    \item \textbf{Operation}: A Bi-directional GRU computes context vectors $H$.
+        \[ H = \text{Bi-GRU}_{\phi_1}(X) \]
+    \item \textbf{Output}: Context vectors \texttt{h\_birnn} ($H \in \mathbb{R}^{B \times T \times 2H_{rnn}}$).
+\end{itemize}
+
+\paragraph{2. Inference RNN (\texttt{self.inference\_rnn}, \texttt{self.fc\_inference})}
+\begin{itemize}
+    \item \textbf{Input at timestep $t$}:
+    \begin{itemize}
+        \item Context vector \texttt{h\_birnn[:, t, :]} ($h_t \in \mathbb{R}^{B \times 2H_{rnn}}$).
+        \item Previous soft state sample \texttt{prev\_c\_soft} ($y_{t-1} \in \mathbb{R}^{B \times K}$), initialized to zeros for $t=1$.
+        \item Previous inference hidden state \texttt{inference\_h} ($s_{t-1} \in \mathbb{R}^{B \times H_{rnn}}$).
+    \end{itemize}
+    \item \textbf{Operation}:
+    \begin{align*}
+        u_t &= [h_t, y_{t-1}] \\
+        s_t &= \text{GRU}_{\phi_2}(u_t, s_{t-1}) \\
+        \alpha_{\phi, t} &= \text{Linear}_{\phi_3}(s_t)
+    \end{align*}
+    \item \textbf{Output}: Logits \texttt{q\_logits\_t} ($\alpha_{\phi, t} \in \mathbb{R}^{B \times K}$) for the posterior distribution $q_{\phi}(c_t | c_{t-1}, X) = \text{Categorical}(\text{logits}=\alpha_{\phi, t})$.
+\end{itemize}
+
+\subsection{Generative Model ($p_{\theta}$) and Reparameterization}
+
+\paragraph{1. Differentiable Sampling (\texttt{F.gumbel\_softmax})}
+\begin{itemize}
+    \item \textbf{Input}: Posterior logits \texttt{q\_logits\_t} ($\alpha_{\phi, t}$).
+    \item \textbf{Operation}: The Gumbel-Softmax trick produces a differentiable sample.
+        \[ y_t = \text{GumbelSoftmax}(\alpha_{\phi, t}, \tau) \]
+    \item \textbf{Output}: A "soft" one-hot vector \texttt{c\_t\_soft} ($y_t \in \mathbb{R}^{B \times K}$).
+\end{itemize}
+
+\paragraph{2. Neural Transition Model (\texttt{self.transition\_net})}
+\begin{itemize}
+    \item \textbf{Input}: Previous soft state sample \texttt{prev\_c\_soft} ($y_{t-1}$).
+    \item \textbf{Operation}: An MLP computes the logits for the prior transition distribution.
+        \[ \alpha_{\theta, t} = \text{MLP}_{\theta_1}(y_{t-1}) \]
+    \item \textbf{Output}: Prior logits \texttt{p\_logits\_t} ($\alpha_{\theta, t} \in \mathbb{R}^{B \times K}$) for the prior $p_{\theta}(c_t | c_{t-1}) = \text{Categorical}(\text{logits}=\alpha_{\theta, t})$. For $t=1$, the prior is a uniform distribution.
+\end{itemize}
+
+\paragraph{3. Emission Model (\texttt{self.emission\_net})}
+\begin{itemize}
+    \item \textbf{Input}: Current soft state sample \texttt{c\_t\_soft} ($y_t$).
+    \item \textbf{Operation}: An MLP generates the parameters for the observation distribution.
+        \[ \mu_t = \text{MLP}_{\theta_2}(y_t) \]
+    \item \textbf{Output}: The mean \texttt{emission\_mean\_t} ($\mu_t \in \mathbb{R}^{B \times N_f}$) for the reconstruction distribution $p_{\theta}(x_t | c_t) = \mathcal{N}(x_t; \mu_t, \sigma^2 I)$.
+\end{itemize}
+
+\section{Synthetic Data Generation (\texttt{data.py})}
+The synthetic data is generated from a true Hidden Markov Model.
+
+\paragraph{1. Transition Matrix ($A$)}
+\begin{itemize}
+    \item \textbf{Parameters}: Number of states $K$ and transition bias $\beta$ (\texttt{transition\_bias}).
+    \item \textbf{Definition}: The $K \times K$ matrix $A$ is defined as:
+    \[
+    A_{ij} = \begin{cases} \beta & \text{if } i=j \\ \frac{1-\beta}{K-1} & \text{if } i \neq j \end{cases}
+    \]
+\end{itemize}
+
+\paragraph{2. Emission Means ($\{\mu_k\}$)}
+\begin{itemize}
+    \item \textbf{Parameters}: Number of states $K$ and number of features $N_f$.
+    \item \textbf{Definition}: For each state $k \in \{1, \dots, K\}$, a mean vector is sampled:
+    \[ \mu_k \sim \mathcal{N}(0, I_{N_f}) \]
+\end{itemize}
+
+\paragraph{3. Sequence Generation}
+\begin{itemize}
+    \item \textbf{State Sequence ($C$)}:
+    \begin{enumerate}
+        \item Initialize: $c_1 \sim \text{Uniform}(\{1, \dots, K\})$.
+        \item For $t=2, \dots, T$: Sample the next state from the corresponding row of the transition matrix: $c_t \sim \text{Categorical}(A_{c_{t-1}, :})$.
+    \end{enumerate}
+    \item \textbf{Observation Sequence ($X$)}:
+    \begin{itemize}
+        \item For $t=1, \dots, T$: Sample an observation using the mean corresponding to the current state: $x_t \sim \mathcal{N}(\mu_{c_t}, I_{N_f})$.
+    \end{itemize}
+\end{itemize}
+
+\section{How to Use}
+
+\subsection{Setup}
+Install the required dependencies:
+\begin{lstlisting}[language=bash]
+pip install torch numpy wandb hydra-core omegaconf scipy
+\end{lstlisting}
+
+\subsection{Configuration}
+All hyperparameters for the data, model, and trainer are managed in \texttt{configs/config.yaml}.
+
+\subsection{Training}
+To run the training, execute the main script from the project's root directory:
+\begin{lstlisting}[language=bash]
+python dssm/main.py
+\end{lstlisting}
+Override any configuration parameter from the command line:
+\begin{lstlisting}[language=bash]
+python dssm/main.py trainer.device=cpu trainer.n_epochs=10
+\end{lstlisting}
+
+\subsection{Evaluation and Accuracy}
+A critical challenge in evaluating unsupervised clustering models is \textbf{state permutation invariance}. The model may learn the correct state clusters but assign them arbitrary integer labels. To address this, the \texttt{\_calculate\_accuracy} function in \texttt{dssm/main.py} uses the \textbf{Hungarian algorithm} to find the optimal one-to-one mapping between predicted and true state labels before computing the accuracy score.
+
+\end{document}
